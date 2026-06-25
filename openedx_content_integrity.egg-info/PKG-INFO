@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: openedx-content-integrity
+Version: 0.1.0
+Summary: Async plagiarism / AI-authenticity reporting for Open edX course content
+Requires-Dist: requests>=2.28
+Requires-Dist: beautifulsoup4>=4.11
+Requires-Dist: lxml>=4.9

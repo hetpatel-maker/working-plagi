@@ -1,0 +1,5 @@
+[cms.djangoapp]
+content_integrity = content_integrity.apps:ContentIntegrityConfig
+
+[lms.djangoapp]
+content_integrity = content_integrity.apps:ContentIntegrityConfig
