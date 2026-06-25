@@ -43,21 +43,10 @@ class CourseReportDownloadView(APIView):
                 return value
 
         def generate():
-            writer = csv.writer(Echo())
+            # Add UTF-8 BOM so Excel opens it perfectly aligned and formatted
+            yield '\ufeff'
             
-            # Add Course Summary at the top
-            from ..models import CourseReport
-            report = CourseReport.objects.filter(course_id=course_id).first()
-            if report:
-                yield writer.writerow(["Course Integrity Summary"])
-                yield writer.writerow(["Total Blocks", report.total_components])
-                yield writer.writerow(["Checked Blocks", report.checked_components])
-                yield writer.writerow(["Flagged Blocks", report.flagged_components])
-                avg_score = f"{report.average_score}%" if report.average_score is not None else "N/A"
-                yield writer.writerow(["Average Plagiarism Score", avg_score])
-                yield writer.writerow(["Report Generated At", report.generated_at.isoformat() if report.generated_at else ""])
-                yield writer.writerow([])  # Blank row separator
-                yield writer.writerow([])  # Blank row separator
+            writer = csv.writer(Echo())
                 
             yield writer.writerow([
                 "Usage Key", "Block Type", "Status", "Plagiarism Score", 
@@ -68,16 +57,17 @@ class CourseReportDownloadView(APIView):
                 details = []
                 for s in check.matched_sources:
                     if isinstance(s, dict):
-                        url = s.get("url", "")
-                        title = s.get("title", "")
+                        url = str(s.get("url", "")).replace('\n', ' ').replace('\r', '')
+                        title = str(s.get("title", "")).replace('\n', ' ').replace('\r', '')
                         words = s.get("matched_words", 0)
-                        snippet = s.get("matched_snippet", "")
-                        
-                        text = f"Title: {title}\nURL: {url}\nWords: {words}\nSnippet: {snippet}"
+                        snippet = str(s.get("matched_snippet", "")).replace('\n', ' ').replace('\r', '')
+                        text = f"Title: {title} | URL: {url} | Words: {words} | Snippet: {snippet}"
                         details.append(text)
-                details_str = "\n\n---\n\n".join(details)
+                details_str = " || ".join(details)
                 
                 reasons = ", ".join(check.flag_reasons) if isinstance(check.flag_reasons, list) else ""
+                clean_error = str(check.error_message).replace('\n', ' ').replace('\r', '')
+                
                 yield writer.writerow([
                     check.usage_key,
                     check.block_type,
@@ -85,14 +75,14 @@ class CourseReportDownloadView(APIView):
                     check.score if check.score is not None else "",
                     check.ai_score if check.ai_score is not None else "",
                     check.grammar_score if check.grammar_score is not None else "",
-                    check.readability_text,
-                    reasons,
+                    str(check.readability_text).replace('\n', ' ').replace('\r', ''),
+                    str(reasons).replace('\n', ' ').replace('\r', ''),
                     details_str,
-                    check.error_message,
+                    clean_error,
                     check.last_checked_at.isoformat() if check.last_checked_at else "",
                 ])
 
-        response = StreamingHttpResponse(generate(), content_type="text/csv")
+        response = StreamingHttpResponse(generate(), content_type="text/csv; charset=utf-8-sig")
         response["Content-Disposition"] = f'attachment; filename="content_integrity_report_{course_id}.csv"'
         return response
 

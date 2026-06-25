@@ -8,7 +8,7 @@ class ContentCheckSerializer(serializers.ModelSerializer):
         model = ContentCheck
         fields = [
             "usage_key", "block_type", "status", "score",
-            "provider", "matched_sources", "last_checked_at",
+            "provider", "matched_sources", "last_checked_at", "scan_id",
         ]
 
 

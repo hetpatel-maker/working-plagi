@@ -51,7 +51,7 @@ def _parse_course_key(course_id_str: str):
 CHECKABLE_TYPES = frozenset({"html", "problem", "video", "openassessment"})
 
 
-def iter_course_blocks(course_id: str, block_types=("html", "problem", "video", "openassessment")):
+def iter_course_blocks(course_id: str, block_types=("vertical",)):
     """Yield {"usage_key": ..., "block_type": ...} for every checkable block
     in a course, reading directly from the modulestore.
 
@@ -125,6 +125,16 @@ def fetch_block_content(usage_key: str) -> dict:
         result["prompt"] = block.prompt
     if hasattr(block, "rubric_criteria"):
         result["rubric_criteria"] = block.rubric_criteria
+
+    # For vertical blocks, gather their children usage keys and recursively fetch their content.
+    if key.block_type == "vertical" and hasattr(block, "children"):
+        result["children"] = []
+        for child_key in block.children:
+            try:
+                child_data = fetch_block_content(str(child_key))
+                result["children"].append(child_data)
+            except Exception as e:
+                log.warning("[content_integrity] Failed to fetch child %s for vertical %s: %s", child_key, usage_key, e)
 
     return result
 
@@ -486,6 +496,42 @@ _EXTRACTORS = {
     "video": _extract_video,
     "openassessment": _extract_openassessment,
 }
+
+# ---------------------------------------------------------------------------
+# Vertical block extraction
+# ---------------------------------------------------------------------------
+
+def _extract_vertical(block: dict) -> str:
+    """
+    Extract text from a vertical block by recursively extracting text from all its children
+    and concatenating them with clear descriptive headers.
+    """
+    parts = []
+    children = block.get("children", [])
+    
+    for child in children:
+        child_id = child.get("id")
+        if not child_id:
+            continue
+            
+        try:
+            # Re-parse usage key to find block type
+            from opaque_keys.edx.keys import UsageKey
+            child_key = UsageKey.from_string(child_id)
+            block_type = child_key.block_type
+            
+            # Extract plain text for the child
+            child_text = extract_plain_text(block_type, child)
+            if child_text and child_text.strip():
+                # Add a descriptive header
+                header = f"\n\n--- [{block_type.upper()} Component] ---\n\n"
+                parts.append(header + child_text.strip())
+        except Exception as e:
+            log.warning("[content_integrity] Failed to extract text for child %s: %s", child_id, e)
+            
+    return "".join(parts).strip()
+
+_EXTRACTORS["vertical"] = _extract_vertical
 
 
 def extract_plain_text(block_type: str, block: dict) -> str:
