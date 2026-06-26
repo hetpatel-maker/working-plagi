@@ -118,6 +118,7 @@ def process_block_publish(self, usage_key, course_id, block_type, force_recheck=
     if not force_recheck and new_hash == check.content_hash and check.status in (
         ContentCheckStatus.CLEAN,
         ContentCheckStatus.FLAGGED,
+        ContentCheckStatus.PENDING,
     ):
         log.info(
             "[content_integrity] HASH MATCH for %s — content unchanged and status is %s, skipping Copyleaks call",
@@ -132,12 +133,18 @@ def process_block_publish(self, usage_key, course_id, block_type, force_recheck=
         "[content_integrity] Content changed or needs check for %s — dispatching run_plagiarism_check (hash: %s -> %s)",
         usage_key, (check.content_hash or "none")[:12], new_hash[:12],
     )
+    
+    # Mark as pending immediately to deduplicate rapid concurrent signals from Open edX
+    check.content_hash = new_hash
+    check.status = ContentCheckStatus.PENDING
+    check.save(update_fields=["content_hash", "status", "updated_at"])
+
     run_plagiarism_check.delay(
         usage_key=usage_key, course_id=course_id, text=text, content_hash=new_hash,
     )
 
 
-@shared_task(bind=True, max_retries=3, default_retry_delay=120)
+@shared_task(bind=True, max_retries=5, default_retry_delay=60, autoretry_for=(Exception,), retry_backoff=True)
 def run_plagiarism_check(self, usage_key, course_id, text, content_hash):
     log.info(
         "[content_integrity] run_plagiarism_check START: usage_key=%s, text_length=%d",
@@ -156,9 +163,17 @@ def run_plagiarism_check(self, usage_key, course_id, text, content_hash):
     # Determine if we have a public webhook domain configured
     public_domain = getattr(settings, "CONTENT_INTEGRITY_PUBLIC_WEBHOOK_DOMAIN", "")
 
+    # Pre-generate and save the scan_id to avoid a race condition where the webhook
+    # hits the server before the Celery task manages to save the scan_id to the database.
+    import uuid
+    scan_id = f"ci-{uuid.uuid4().hex[:12]}"
+    check.scan_id = scan_id
+    check.status = ContentCheckStatus.PENDING
+    check.save(update_fields=["scan_id", "status", "updated_at"])
+
     try:
         # Pass the public domain to check_text so it can build the webhook URL if available
-        result = provider.check_text(text, webhook_url=public_domain)
+        result = provider.check_text(text, webhook_url=public_domain, scan_id=scan_id)
     except Exception as exc:
         log.error(
             "[content_integrity] Provider check_text failed for %s: %s",
@@ -171,12 +186,11 @@ def run_plagiarism_check(self, usage_key, course_id, text, content_hash):
 
     check.content_hash = content_hash
     check.provider = provider.name
-    check.scan_id = result.scan_id or ""
 
     if result.is_pending:
         log.info("[content_integrity] Provider check for %s is PENDING via webhook.", usage_key)
-        check.status = ContentCheckStatus.PENDING
-        check.save(update_fields=["content_hash", "provider", "scan_id", "status", "updated_at"])
+        # scan_id and status are already saved above
+        check.save(update_fields=["content_hash", "provider", "updated_at"])
         # Do not refresh_course_report here; wait for webhook
         return
 
@@ -328,3 +342,41 @@ def nightly_resweep(course_id):
         log.info("[content_integrity] nightly_resweep DONE: enqueued %d blocks for course %s with force_recheck", count, course_id)
     except Exception as exc:
         log.exception("[content_integrity] Failed nightly resweep for course %s", course_id)
+
+
+@shared_task(bind=True, max_retries=5, default_retry_delay=60, autoretry_for=(Exception,), retry_backoff=True)
+def trigger_copyleaks_pdf_export(self, scan_id, export_id):
+    """
+    Triggers the Copyleaks Export API to generate a PDF report for a given scan.
+    Uses Celery's exponential backoff (retry_backoff=True) for robustness.
+    """
+    log.info("[content_integrity] trigger_copyleaks_pdf_export START for scan %s (export %s)", scan_id, export_id)
+    
+    try:
+        check = ContentCheck.objects.get(scan_id=scan_id)
+    except ContentCheck.DoesNotExist:
+        log.warning("[content_integrity] ContentCheck for scan_id %s vanished before export could run — aborting", scan_id)
+        return
+
+    provider = get_provider()
+    
+    # Check if the provider supports pdf export
+    if not hasattr(provider, 'export_pdf_report'):
+        log.warning("[content_integrity] Provider %s does not support export_pdf_report", provider.name)
+        return
+
+    # Determine if we have a public webhook domain configured
+    public_domain = getattr(settings, "CONTENT_INTEGRITY_PUBLIC_WEBHOOK_DOMAIN", "http://example.com")
+    
+    webhook_url = f"{public_domain.rstrip('/')}/api/content-integrity/v1/copyleaks-pdf-webhook/{scan_id}/"
+
+    try:
+        provider.export_pdf_report(scan_id, export_id, webhook_url)
+        log.info("[content_integrity] PDF export triggered successfully for scan %s", scan_id)
+    except Exception as exc:
+        log.error(
+            "[content_integrity] Provider export_pdf_report failed for scan %s: %s",
+            scan_id, exc,
+        )
+        raise exc # Celery will automatically retry due to autoretry_for
+

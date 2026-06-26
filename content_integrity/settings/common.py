@@ -13,7 +13,15 @@ def plugin_settings(settings):
 
     # Similarity percentage at/above which a block is marked FLAGGED rather than CLEAN.
     settings.CONTENT_INTEGRITY_FLAG_THRESHOLD = 20.0
+    
+    # 1. The public URL for Copyleaks to talk to
+    settings.CONTENT_INTEGRITY_PUBLIC_WEBHOOK_DOMAIN = "https://paragraph-wing-valid.ngrok-free.dev"
 
+    # 2. Tell Django not to block requests from Ngrok in local dev
+    if not hasattr(settings, "ALLOWED_HOSTS"):
+        settings.ALLOWED_HOSTS = []
+    if ".ngrok-free.dev" not in settings.ALLOWED_HOSTS:
+        settings.ALLOWED_HOSTS.append(".ngrok-free.dev")
     if not getattr(settings, "CONTENT_INTEGRITY_PLAGIARISMCHECK_API_TOKEN", ""):
         settings.CONTENT_INTEGRITY_PLAGIARISMCHECK_API_TOKEN = ""
     if not getattr(settings, "CONTENT_INTEGRITY_COPYLEAKS_EMAIL", ""):

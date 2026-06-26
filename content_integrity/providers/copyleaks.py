@@ -18,6 +18,8 @@ import uuid
 from typing import Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from django.conf import settings
 
 from .base import CheckResult, MatchedSource, PlagiarismProvider
@@ -35,6 +37,16 @@ class CopyleaksProvider(PlagiarismProvider):
         self.email = email or getattr(settings, "CONTENT_INTEGRITY_COPYLEAKS_EMAIL", "")
         self.api_key = api_key or getattr(settings, "CONTENT_INTEGRITY_COPYLEAKS_API_KEY", "")
         self._token = None
+        
+        # Configure robust HTTP session with exponential backoff for rate limits
+        self.session = requests.Session()
+        retries = Retry(
+            total=5, 
+            backoff_factor=2, 
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "PUT", "POST", "OPTIONS"]
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
     def _get_token(self) -> str:
         from django.core.cache import cache
@@ -45,7 +57,8 @@ class CopyleaksProvider(PlagiarismProvider):
             return cached
 
         log.info("[content_integrity] Requesting new Copyleaks auth token for email=%s", self.email)
-        resp = requests.post(LOGIN_URL, json={"email": self.email, "key": self.api_key}, timeout=10)
+        log.info("[content_integrity] Requesting new Copyleaks auth token for email=%s", self.email)
+        resp = self.session.post(LOGIN_URL, json={"email": self.email, "key": self.api_key}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         token = data["access_token"]
@@ -71,15 +84,16 @@ class CopyleaksProvider(PlagiarismProvider):
         A fresh token guarantees 0 old webhooks = instant result pickup.
         """
         log.info("[content_integrity] Requesting fresh webhook.site token for this scan")
-        resp = requests.post("https://webhook.site/token", timeout=10)
+        log.info("[content_integrity] Requesting fresh webhook.site token for this scan")
+        resp = self.session.post("https://webhook.site/token", timeout=10)
         resp.raise_for_status()
         token = resp.json()["uuid"]
         log.info("[content_integrity] Got fresh webhook.site token: %s", token)
         return token
 
-    def check_text(self, text: str, webhook_url: Optional[str] = None) -> CheckResult:
-        # Generate a unique scan ID.
-        scan_id = f"ci-{uuid.uuid4().hex[:12]}"
+    def check_text(self, text: str, webhook_url: Optional[str] = None, scan_id: Optional[str] = None) -> CheckResult:
+        # Generate a unique scan ID if not provided by the caller.
+        scan_id = scan_id or f"ci-{uuid.uuid4().hex[:12]}"
         log.info(
             "[content_integrity] Copyleaks check_text START: scan_id=%s, text_length=%d chars, webhook_url=%s",
             scan_id, len(text), webhook_url,
@@ -91,16 +105,17 @@ class CopyleaksProvider(PlagiarismProvider):
         sandbox = getattr(settings, "CONTENT_INTEGRITY_COPYLEAKS_SANDBOX", True)
         log.info("[content_integrity] Copyleaks sandbox mode: %s", sandbox)
         
+        secret = getattr(settings, "CONTENT_INTEGRITY_WEBHOOK_SECRET", "ci-secret-token")
         is_fallback_polling = False
         if webhook_url:
             # We have a real URL provided by the CMS, use it!
             # webhook_url is the domain, e.g. https://studio.myuniversity.com
-            final_webhook_url = f"{webhook_url.rstrip('/')}/api/content-integrity/v1/copyleaks-webhook/{scan_id}/{{STATUS}}/"
+            final_webhook_url = f"{webhook_url.rstrip('/')}/api/content-integrity/v1/copyleaks-webhook/{scan_id}/{{STATUS}}/?token={secret}"
         else:
             # Local dev fallback: use webhook.site
             log.info("[content_integrity] No webhook_url provided, falling back to webhook.site polling for local dev.")
             webhook_token = self._get_fresh_webhook_token()
-            final_webhook_url = f"https://webhook.site/{webhook_token}?scan_id={scan_id}&status={{STATUS}}"
+            final_webhook_url = f"https://webhook.site/{webhook_token}?scan_id={scan_id}&status={{STATUS}}&token={secret}"
             is_fallback_polling = True
         payload = {
             "base64": text_b64,
@@ -108,10 +123,11 @@ class CopyleaksProvider(PlagiarismProvider):
             "properties": {
                 "sandbox": sandbox,
                 "webhooks": {
-                    "status": final_webhook_url,
-                    "headers": [
-                        ["Authorization", f"Bearer {getattr(settings, 'CONTENT_INTEGRITY_WEBHOOK_SECRET', 'ci-secret-token')}"]
-                    ]
+                    "status": final_webhook_url
+                },
+                "pdf": {
+                    "create": True,
+                    "reportVersion": "latest"
                 }
             }
         }
@@ -128,7 +144,7 @@ class CopyleaksProvider(PlagiarismProvider):
 
         # Submit the scan
         log.info("[content_integrity] Submitting scan %s to Copyleaks API (%s endpoint)", scan_id, endpoint_type)
-        resp = requests.put(
+        resp = self.session.put(
             f"{API_BASE}/{endpoint_type}/submit/file/{scan_id}",
             json=payload,
             headers=self._headers(),
@@ -168,7 +184,7 @@ class CopyleaksProvider(PlagiarismProvider):
         while elapsed < max_wait_seconds:
             poll_count += 1
             try:
-                resp = requests.get(
+                resp = self.session.get(
                     f"https://webhook.site/token/{webhook_token}/requests",
                     timeout=20,
                 )
@@ -321,3 +337,38 @@ class CopyleaksProvider(PlagiarismProvider):
             readability_text=str(readability_text),
             raw_response=payload,
         )
+
+    def export_pdf_report(self, scan_id: str, export_id: str, webhook_url: str):
+        """
+        Triggers the Copyleaks Export API to generate and send a PDF report to our webhook.
+        https://api.copyleaks.com/documentation/v3/downloads/export
+        """
+        log.info(
+            "[content_integrity] Copyleaks export_pdf_report START: scan_id=%s, export_id=%s, webhook_url=%s",
+            scan_id, export_id, webhook_url,
+        )
+
+        payload = {
+            "pdfReport": {
+                "verb": "POST",
+                "endpoint": webhook_url,
+                "headers": [
+                    ["Authorization", f"Bearer {getattr(settings, 'CONTENT_INTEGRITY_WEBHOOK_SECRET', 'ci-secret-token')}"]
+                ]
+            },
+            "completionWebhook": f"{webhook_url}?event=export_completed"
+        }
+
+        log.info("[content_integrity] Submitting export request to Copyleaks for scan %s", scan_id)
+        resp = self.session.post(
+            f"{API_BASE}/downloads/{scan_id}/export/{export_id}",
+            json=payload,
+            headers=self._headers(),
+            timeout=15,
+        )
+        
+        if not resp.ok:
+            log.error("[content_integrity] Copyleaks Export API failed for %s: %s %s", scan_id, resp.status_code, resp.text)
+            resp.raise_for_status()
+
+        log.info("[content_integrity] Export triggered successfully for scan %s (HTTP %d)", scan_id, resp.status_code)

@@ -49,6 +49,13 @@ class ContentCheck(models.Model):
     
     error_message = models.TextField(blank=True, default="")
 
+    report_pdf = models.FileField(
+        upload_to="copyleaks_reports/",
+        null=True,
+        blank=True,
+        help_text="The downloaded PDF report from Copyleaks",
+    )
+
     last_checked_at = models.DateTimeField(null=True, blank=True)
     content_changed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -1,7 +1,8 @@
 import csv
 import json
 import logging
-from django.http import StreamingHttpResponse, JsonResponse
+from django.http import StreamingHttpResponse, JsonResponse, HttpResponse
+from django.core.files.base import ContentFile
 from rest_framework.generics import RetrieveAPIView, ListAPIView
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -100,9 +101,13 @@ class CopyleaksWebhookView(APIView):
         
         # 1. Security Check
         secret = getattr(settings, "CONTENT_INTEGRITY_WEBHOOK_SECRET", "ci-secret-token")
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header != f"Bearer {secret}":
-            log.warning("[content_integrity] Unauthorized webhook attempt for %s", scan_id)
+        
+        token = request.GET.get("token")
+        if token != secret:
+            log.warning(
+                "[content_integrity] Unauthorized webhook attempt for %s. Token mismatch.", 
+                scan_id
+            )
             return JsonResponse({"error": "Unauthorized"}, status=403)
         
         try:
@@ -145,7 +150,7 @@ class CopyleaksWebhookView(APIView):
         ai_threshold = getattr(settings, "CONTENT_INTEGRITY_AI_FLAG_THRESHOLD", 50.0)
 
         check.score = result.score
-        check.matched_sources = result.matched_sources
+        check.matched_sources = [m.to_dict() for m in result.matched_sources]
         check.ai_score = result.ai_generated_likelihood
         check.grammar_score = result.grammar_score
         check.readability_text = result.readability_text
@@ -168,8 +173,58 @@ class CopyleaksWebhookView(APIView):
 
         log.info("[content_integrity] Webhook processed for scan %s. Score: %s, Status: %s", scan_id, check.score, check.status)
 
+        # Trigger PDF Export (Dev mode: triggering for ALL completed scans)
+        from ..tasks import trigger_copyleaks_pdf_export
+        import uuid
+        export_id = f"exp-{uuid.uuid4().hex[:12]}"
+        trigger_copyleaks_pdf_export.delay(scan_id, export_id)
+        log.info("[content_integrity] Queued PDF export task %s for scan %s (Dev Mode: all scans exported)", export_id, scan_id)
+
         # Refresh the course report
         from ..tasks import refresh_course_report
         refresh_course_report.delay(check.course_id)
 
         return JsonResponse({"status": "success"})
+
+
+class CopyleaksPdfWebhookView(APIView):
+    """POST /api/content-integrity/v1/copyleaks-pdf-webhook/<scan_id>/"""
+    # Copyleaks calls this, so we cannot use session authentication
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, scan_id):
+        # Copyleaks sends a separate JSON webhook when the entire export batch is complete.
+        # We don't need the JSON payload, so we just acknowledge it and return 200.
+        if request.GET.get("event") == "export_completed":
+            log.info("[content_integrity] Export completion webhook received for scan %s", scan_id)
+            return HttpResponse(status=200)
+
+        log.info("[content_integrity] PDF Webhook received for scan_id: %s", scan_id)
+        from django.conf import settings
+        
+        # 1. Security Check
+        secret = getattr(settings, "CONTENT_INTEGRITY_WEBHOOK_SECRET", "ci-secret-token")
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {secret}":
+            log.warning("[content_integrity] Unauthorized PDF webhook attempt for %s", scan_id)
+            return JsonResponse({"error": "Unauthorized"}, status=403)
+        
+        try:
+            check = ContentCheck.objects.get(scan_id=scan_id)
+        except ContentCheck.DoesNotExist:
+            log.warning("[content_integrity] PDF Webhook received for unknown scan_id: %s", scan_id)
+            return JsonResponse({"error": "Unknown scan_id"}, status=404)
+
+        # 2. Save the PDF binary data
+        pdf_binary = request.body
+        if not pdf_binary:
+            log.warning("[content_integrity] PDF Webhook for scan_id %s received empty body", scan_id)
+            return JsonResponse({"error": "Empty body"}, status=400)
+            
+        file_name = f"report_{scan_id}.pdf"
+        check.report_pdf.save(file_name, ContentFile(pdf_binary))
+        check.save(update_fields=["report_pdf", "updated_at"])
+
+        log.info("[content_integrity] Successfully saved PDF report for scan_id: %s", scan_id)
+        return HttpResponse(status=200)
