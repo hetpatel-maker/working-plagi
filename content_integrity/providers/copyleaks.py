@@ -95,7 +95,7 @@ class CopyleaksProvider(PlagiarismProvider):
         if webhook_url:
             # We have a real URL provided by the CMS, use it!
             # webhook_url is the domain, e.g. https://studio.myuniversity.com
-            final_webhook_url = f"{webhook_url.rstrip('/')}/api/content_integrity/v1/copyleaks-webhook/{scan_id}/{{STATUS}}/"
+            final_webhook_url = f"{webhook_url.rstrip('/')}/api/content-integrity/v1/copyleaks-webhook/{scan_id}/{{STATUS}}/"
         else:
             # Local dev fallback: use webhook.site
             log.info("[content_integrity] No webhook_url provided, falling back to webhook.site polling for local dev.")
